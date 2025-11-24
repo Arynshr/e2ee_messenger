@@ -5,7 +5,7 @@ Detects simple replays via timestamp validation.
 import asyncio
 import ssl
 from typing import Dict
-from encrypt.protocol import unpack_connect, pack_ack, unpack_message, MSG_TYPES
+from .protocol import unpack_connect, pack_ack, unpack_message, MSG_TYPES
 
 class RelayServer:
     def __init__(self, host: str = '127.0.0.1', port: int = 8888):
@@ -14,6 +14,7 @@ class RelayServer:
         self.clients: Dict[bytes, asyncio.StreamWriter] = {}  # PK -> writer
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Handle a new client connection."""
         addr = writer.get_extra_info('peername')
         pk = None
         
@@ -22,6 +23,11 @@ class RelayServer:
         try:
             # Handshake
             data = await reader.read(1024)
+            if not data:
+                writer.close()
+                await writer.wait_closed()
+                return
+                
             conn = unpack_connect(data)
             
             if not conn or conn.get('type') != MSG_TYPES['connect']:
@@ -52,20 +58,34 @@ class RelayServer:
                 to_pk = bytes(msg['to'])
                 if to_pk in self.clients:
                     target_writer = self.clients[to_pk]
-                    target_writer.write(data)
-                    await target_writer.drain()
-                    print(f"Relayed {len(data)}B: {pk.hex()[:8]} -> {to_pk.hex()[:8]}")
+                    try:
+                        target_writer.write(data)
+                        await target_writer.drain()
+                        print(f"Relayed {len(data)}B: {pk.hex()[:8]} -> {to_pk.hex()[:8]}")
+                    except (ConnectionError, OSError):
+                        # Target client disconnected, remove from clients
+                        if to_pk in self.clients:
+                            del self.clients[to_pk]
+                        print(f"Target {to_pk.hex()[:8]} disconnected during relay")
                 else:
                     print(f"Unknown target: {to_pk.hex()[:8]}")
                 
                 # Ack to sender (echo hash)
-                writer.write(pack_ack(msg['h']))
-                await writer.drain()
+                try:
+                    writer.write(pack_ack(msg['h']))
+                    await writer.drain()
+                except (ConnectionError, OSError):
+                    # Sender disconnected
+                    break
                 
         except asyncio.CancelledError:
-            print(f"Handler cancelled for {addr}")
+            if addr:
+                print(f"Handler cancelled for {addr}")
         except Exception as e:
-            print(f"Handler error for {addr}: {e}")
+            if addr:
+                print(f"Handler error for {addr}: {e}")
+            else:
+                print(f"Handler error: {e}")
         finally:
             if pk and pk in self.clients:
                 del self.clients[pk]
@@ -74,10 +94,12 @@ class RelayServer:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except:
+            except (OSError, asyncio.CancelledError):
+                # Connection already closed or cancelled
                 pass
             
-            print(f"Client disconnected: {addr}")
+            if addr:
+                print(f"Client disconnected: {addr}")
 
     async def start(self, ssl_context: ssl.SSLContext):
         server = await asyncio.start_server(
@@ -96,10 +118,15 @@ class RelayServer:
 async def run():
     """Main server entry point."""
     # Load TLS cert
-    ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ssl_ctx.load_cert_chain('cert.pem', 'key.pem')
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE  # Demo only
+    try:
+        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_ctx.load_cert_chain('cert.pem', 'key.pem')
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE  # Demo only - WARNING: Not secure for production
+    except (FileNotFoundError, ssl.SSLError) as e:
+        print(f"Error loading SSL certificates: {e}")
+        print("Run bootstrap.sh to generate certificates")
+        raise
     
     relay = RelayServer()
     await relay.start(ssl_ctx)

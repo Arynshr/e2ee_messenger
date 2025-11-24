@@ -14,8 +14,8 @@ from textual.widgets import Header, Footer, Input, Button, Static, RichLog
 from textual.reactive import reactive
 from textual.message import Message
 from textual import on
-from encrypt.crypto import Identity, key_exchange, encrypt, decrypt, hash_message, SecureLogger, PublicKey
-from encrypt.protocol import pack_connect, pack_message, unpack_message, pack_ack, unpack_ack, MSG_TYPES
+from .crypto import Identity, key_exchange, key_exchange_server, encrypt, decrypt, hash_message, SecureLogger, PublicKey
+from .protocol import pack_connect, pack_message, unpack_message, pack_ack, unpack_ack, MSG_TYPES
 
 
 class LeakAlert(Message):
@@ -116,27 +116,30 @@ class ChatApp(App):
             self.peer_pk = peer_id.pk.encode()
             
             # Derive session keys
-            # Client side always derives the same way regardless of who they are
-            # The key exchange creates symmetric keys where:
-            # Alice's tx_key = Bob's rx_key
-            # Alice's rx_key = Bob's tx_key
-            if self.user == 'alice':
-                # Alice uses client key exchange
+            # For key exchange to work, both parties must agree on roles:
+            # - The party with the lexicographically smaller public key is "client"
+            # - The party with the larger public key is "server"
+            my_pk = self.identity.pk.encode()
+            
+            # Determine roles based on public key comparison
+            i_am_client = my_pk < self.peer_pk
+            
+            if i_am_client:
+                # I'm client, peer is server
                 self.tx_key, self.rx_key = key_exchange(
                     self.identity.sk, 
                     self.identity.pk, 
                     PublicKey(self.peer_pk)
                 )
-                self.write_log(f"[dim]Alice keys: TX={self.tx_key.hex()[:16]}... RX={self.rx_key.hex()[:16]}...[/]")
+                self.write_log(f"[dim]Role: CLIENT | TX={self.tx_key.hex()[:16]}... RX={self.rx_key.hex()[:16]}...[/]")
             else:
-                # Bob uses server key exchange (reversed perspective)
-                from src.encrypt.crypto import key_exchange_server
-                self.rx_key, self.tx_key = key_exchange_server(
+                # I'm server, peer is client
+                self.tx_key, self.rx_key = key_exchange_server(
                     self.identity.sk,
                     self.identity.pk,
                     PublicKey(self.peer_pk)
                 )
-                self.write_log(f"[dim]Bob keys: TX={self.tx_key.hex()[:16]}... RX={self.rx_key.hex()[:16]}...[/]")
+                self.write_log(f"[dim]Role: SERVER | TX={self.tx_key.hex()[:16]}... RX={self.rx_key.hex()[:16]}...[/]")
 
             self.connected = True
             self.query_one('#status', StatusBar).update("Connected")
@@ -148,9 +151,13 @@ class ChatApp(App):
         except FileNotFoundError as e:
             self.write_log(f"[red]Error: Peer key file not found - {e}[/]")
             self.query_one('#status', StatusBar).update("Key Error")
-        except Exception as e:
+        except (ConnectionError, OSError, ssl.SSLError, ValueError) as e:
             self.write_log(f"[red]Connection failed: {e}[/]")
             self.query_one('#status', StatusBar).update("Connection Failed")
+        except Exception as e:
+            # Catch-all for unexpected errors
+            self.write_log(f"[red]Unexpected error: {e}[/]")
+            self.query_one('#status', StatusBar).update("Error")
 
     async def receive_loop(self):
         if not self.reader:
@@ -179,15 +186,35 @@ class ChatApp(App):
                     else:
                         self.write_log(f"[yellow]Unknown message type: {msg_type}[/]")
                         
-                except Exception as e:
+                except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException, ValueError, TypeError) as e:
                     self.write_log(f"[yellow]Failed to parse message: {e}[/]")
                     continue
 
-            except Exception as e:
+            except (ConnectionError, OSError, asyncio.IncompleteReadError) as e:
                 self.write_log(f"[red]Recv error: {e}[/]")
+                break
+            except asyncio.CancelledError:
+                # Task was cancelled
                 break
 
         self.connected = False
+        # Clean up pending ACKs on disconnect
+        for future in self.pending_acks.values():
+            if not future.done():
+                future.cancel()
+        self.pending_acks.clear()
+        
+        # Close writer if still open
+        if self.writer:
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except (OSError, asyncio.CancelledError):
+                pass
+            finally:
+                self.writer = None
+                self.reader = None
+        
         self.query_one('#status', StatusBar).update("Disconnected")
 
     async def handle_message(self, msg: dict) -> None:
@@ -199,15 +226,18 @@ class ChatApp(App):
             self.write_log("[red]Error: No receive key available[/]")
             return
         
-        self.write_log(f"[dim]Attempting decrypt with RX key: {self.rx_key.hex()[:16]}...[/]")
-        self.write_log(f"[dim]Ciphertext length: {len(ct)} bytes[/]")
-            
-        plain = decrypt(self.rx_key, ct)
+        try:
+            plain = decrypt(self.rx_key, ct)
+        except Exception as e:
+            self.write_log(f"[red]Decryption error: {e}[/]")
+            self.post_message(LeakAlert())
+            return
         
         if plain is None:
             self.post_message(LeakAlert())
             self.write_log("[red]DECRYPT FAILED: Potential leak/tamper![/]")
-            self.write_log(f"[red]Debug: RX key = {self.rx_key.hex()[:32]}...[/]")
+            self.write_log(f"[dim]Debug: Ciphertext length: {len(ct)}, RX key length: {len(self.rx_key) if self.rx_key else 0}[/]")
+            self.write_log("[yellow]Tip: Run 'python debug_keys.py' to verify key exchange[/]")
             return
 
         computed_hash = hash_message(plain)
@@ -229,7 +259,11 @@ class ChatApp(App):
         if ack_hash in self.pending_acks:
             future = self.pending_acks.pop(ack_hash)
             if not future.done():
-                future.set_result(ack_hash)
+                try:
+                    future.set_result(ack_hash)
+                except asyncio.InvalidStateError:
+                    # Future already completed/cancelled
+                    pass
 
     @on(Button.Pressed, "#send")
     @on(Input.Submitted, "#input")
@@ -253,9 +287,7 @@ class ChatApp(App):
             msg_hash = hash_message(msg_bytes)
 
             # Encrypt using tx_key
-            self.write_log(f"[dim]Encrypting with TX key: {self.tx_key.hex()[:16]}...[/]")
             ct = encrypt(self.tx_key, msg_bytes)
-            self.write_log(f"[dim]Ciphertext length: {len(ct)} bytes[/]")
 
             # Create future for ACK
             ack_future = asyncio.get_event_loop().create_future()
@@ -280,7 +312,7 @@ class ChatApp(App):
                 if msg_hash in self.pending_acks:
                     del self.pending_acks[msg_hash]
                 
-        except Exception as e:
+        except (ConnectionError, OSError, ValueError) as e:
             self.write_log(f"[red]Send error: {e}[/]")
             if msg_hash in self.pending_acks:
                 del self.pending_acks[msg_hash]

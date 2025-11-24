@@ -16,10 +16,15 @@ def pack_connect(pk: bytes) -> bytes:
     """Handshake: Send public key."""
     return msgpack.packb({'type': MSG_TYPES['connect'], 'pk': pk})
 
-def unpack_connect(data: bytes) -> Dict[str, Any]:
+def unpack_connect(data: bytes) -> Optional[Dict[str, Any]]:
     """Unpack connection handshake."""
-    result = msgpack.unpackb(data, raw=False)
-    return cast(Dict[str, Any], result)
+    try:
+        result = msgpack.unpackb(data, raw=False)
+        if not isinstance(result, dict):
+            return None
+        return cast(Dict[str, Any], result)
+    except (ValueError, TypeError, msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException):
+        return None
 
 def pack_message(to_pk: bytes, msg_hash: bytes, ciphertext: bytes, ts: float) -> bytes:
     """Encrypted msg + metadata for relay."""
@@ -32,19 +37,25 @@ def pack_message(to_pk: bytes, msg_hash: bytes, ciphertext: bytes, ts: float) ->
     })
 
 def unpack_message(data: bytes) -> Optional[Dict[str, Any]]:
-    """Validate ts (anti-replay, <30s)."""
+    """Validate ts (anti-replay, <60s)."""
     try:
         msg = msgpack.unpackb(data, raw=False)
         if not isinstance(msg, dict):
             return None
         
-        # Validate timestamp
+        # Validate timestamp - increased window to 60s for network delays
         timestamp = msg.get('t')
-        if timestamp is None or abs(time.time() - float(timestamp)) > 30:
-            return None  # Stale or missing timestamp
+        if timestamp is None:
+            return None
+        try:
+            time_diff = abs(time.time() - float(timestamp))
+            if time_diff > 60:  # Increased from 30s to handle network delays
+                return None  # Stale timestamp
+        except (ValueError, TypeError):
+            return None
         
         return cast(Dict[str, Any], msg)
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException):
         return None
 
 def pack_ack(hash_val: bytes) -> bytes:
@@ -69,9 +80,8 @@ def unpack_ack(data: bytes) -> Optional[bytes]:
             return bytes(h)
         else:
             return None
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException):
         return None
 
-def generate_nonce() -> bytes:
-    """Generate random nonce for replay protection."""
-    return nacl_random(24)
+# Note: generate_nonce() is unused - nonces are generated in encrypt() function
+# Keeping for potential future use or removing if not needed

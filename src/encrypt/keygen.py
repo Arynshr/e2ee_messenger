@@ -4,7 +4,7 @@ Usage: python -m src.encrypt.keygen alice bob
 """
 import sys
 from pathlib import Path
-from src.encrypt.crypto import Identity
+from .crypto import Identity
 
 def generate_keys(users):
     """Generate X25519 keypairs for each user."""
